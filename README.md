@@ -52,3 +52,7 @@ WebCartographer uses a standard tile pyramid where every tile at zoom `n` corres
 2. For each subsequent zoom, computes the doubled bounding box of the previous zoom's hits (with a small padding) and attempts a GET on every coordinate. `404`s on the edges are expected and cheap.
 
 No separate HEAD-probe pass and no second GET — every successful request writes a tile straight to disk. Progress bars show `ok`, `miss` (404), `fail`, and `cached` counters in real time.
+
+## How it looks like
+
+![alt text](program_screenshot.png)
