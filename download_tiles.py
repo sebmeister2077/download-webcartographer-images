@@ -53,6 +53,21 @@ def tile_path(out: Path, zoom: int, x: int, y: int) -> Path:
     return out / f"zoom_{zoom}" / f"{x}_{y}.png"
 
 
+def local_tiles(out: Path, zoom: int) -> list[tuple[int, int]]:
+    zoom_dir = out / f"zoom_{zoom}"
+    if not zoom_dir.is_dir():
+        return []
+
+    tiles: list[tuple[int, int]] = []
+    for path in zoom_dir.glob("*.png"):
+        try:
+            x_text, y_text = path.stem.split("_", 1)
+            tiles.append((int(x_text), int(y_text)))
+        except ValueError:
+            continue
+    return tiles
+
+
 async def fetch_tile(
     session: aiohttp.ClientSession,
     url: str,
@@ -145,6 +160,24 @@ def doubled(box: tuple[int, int, int, int], pad: int) -> tuple[int, int, int, in
     return (xmin * 2 - pad, xmax * 2 + 1 + pad, ymin * 2 - pad, ymax * 2 + 1 + pad)
 
 
+def infer_zoom_box_from_local(out: Path, zoom: int) -> tuple[int, int, int, int] | None:
+    hits = local_tiles(out, zoom)
+    if hits:
+        return bounds_of(hits)
+
+    for source_zoom in range(zoom - 1, 0, -1):
+        source_hits = local_tiles(out, source_zoom)
+        if not source_hits:
+            continue
+
+        box = bounds_of(source_hits)
+        for _ in range(source_zoom, zoom):
+            box = doubled(box, EDGE_PAD)
+        return box
+
+    return None
+
+
 async def main_async(args: argparse.Namespace) -> int:
     base = f"{args.origin.rstrip('/')}{args.path}"
     out = Path(args.output)
@@ -166,6 +199,42 @@ async def main_async(args: argparse.Namespace) -> int:
     print(f"out:    {out.resolve()}\n")
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        if args.redo_zoom is not None:
+            box = infer_zoom_box_from_local(out, args.redo_zoom)
+            if box is None:
+                print(
+                    f"redo zoom {args.redo_zoom}: no local tiles found for zoom {args.redo_zoom} "
+                    "or any lower zoom to infer bounds from."
+                )
+                return 1
+
+            counts, hits = await process_zoom(
+                session,
+                base,
+                out,
+                args.redo_zoom,
+                box,
+                sem,
+                False,
+                "redo",
+            )
+
+            if not hits:
+                print(f"redo zoom {args.redo_zoom}: no tiles found in inferred bounds; nothing refreshed.")
+                return 1
+
+            xmin, xmax, ymin, ymax = bounds_of(hits)
+            print(
+                f"  zoom {args.redo_zoom}: ok={counts[OK]} cached={counts[CACHED]} "
+                f"miss={counts[MISS]} fail={counts[FAIL]}  "
+                f"bounds x[{xmin}..{xmax}] y[{ymin}..{ymax}]\n"
+            )
+            print(
+                f"Done. ok={counts[OK]:,} cached={counts[CACHED]:,} "
+                f"miss={counts[MISS]:,} fail={counts[FAIL]:,}"
+            )
+            return 0 if counts[FAIL] == 0 else 2
+
         totals = {OK: 0, MISS: 0, FAIL: 0, CACHED: 0}
         probe_box = (args.probe_min, args.probe_max, args.probe_min, args.probe_max)
         last_hits: list[tuple[int, int]] | None = None
@@ -216,6 +285,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--path", default=DEFAULT_PATH, help="Tile path prefix relative to origin (default: %(default)s)")
     p.add_argument("--min-zoom", type=int, default=DEFAULT_MIN_ZOOM, help="Lowest zoom level (default: %(default)s)")
     p.add_argument("--max-zoom", type=int, default=DEFAULT_MAX_ZOOM, help="Highest zoom level (default: %(default)s)")
+    p.add_argument(
+        "--redo-zoom",
+        type=int,
+        help="Re-download only one zoom level, inferring bounds from existing local tiles.",
+    )
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Concurrent HTTP requests (default: %(default)s)")
     p.add_argument(
         "--probe-min", type=int, default=DEFAULT_PROBE_MIN,
@@ -232,7 +306,10 @@ def parse_args() -> argparse.Namespace:
         help="Re-download tiles even if they already exist locally.",
     )
     p.set_defaults(skip_existing=True)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.redo_zoom is not None and args.redo_zoom < 1:
+        p.error("--redo-zoom must be 1 or higher")
+    return args
 
 
 def main() -> None:

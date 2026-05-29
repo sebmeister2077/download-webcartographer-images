@@ -32,6 +32,12 @@ Different server:
 python download_tiles.py --origin https://map.ap.aurafury.org
 ```
 
+Redo just one already-downloaded zoom layer:
+
+```powershell
+python download_tiles.py --redo-zoom 5
+```
+
 ### Useful options
 
 | Flag | Default | Notes |
@@ -42,6 +48,7 @@ python download_tiles.py --origin https://map.ap.aurafury.org
 | `--probe-min` / `--probe-max` | `-8` / `40` | Initial probe box on both axes at the lowest zoom (defaults cover a ~1M-block world). Widen if the first zoom reports "no tiles found". |
 | `--concurrency` | `64` | Concurrent HTTP requests. |
 | `--output` | `downloads` | Output directory. |
+| `--redo-zoom` | off | Re-download only one zoom level, using existing local tiles to infer its bounds. This ignores `--skip-existing` for that zoom and is meant for refreshing a layer you already downloaded once. |
 | `--no-skip-existing` | off | Re-download tiles even if they already exist. |
 
 ## How it works
