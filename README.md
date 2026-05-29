@@ -38,18 +38,17 @@ python download_tiles.py --origin https://map.ap.aurafury.org
 | --- | --- | --- |
 | `--origin` | `https://map.oldtops.vintagestory.at` | Base URL of the webmap. |
 | `--path` | `/data/world` | Tile path prefix appended to the origin. |
-| `--min-zoom` / `--max-zoom` | `0` / `9` | Zoom range to download. |
-| `--probe-min` / `--probe-max` | `-16` / `64` | Initial zoom-0 search box on both axes (defaults cover a ~1M-block world). Widen if zoom 0 reports "no tiles found". |
-| `--concurrency` | `32` | Concurrent HTTP requests. |
+| `--min-zoom` / `--max-zoom` | `1` / `9` | Zoom range to download (WebCartographer's pyramid starts at zoom 1). |
+| `--probe-min` / `--probe-max` | `-8` / `40` | Initial probe box on both axes at the lowest zoom (defaults cover a ~1M-block world). Widen if the first zoom reports "no tiles found". |
+| `--concurrency` | `64` | Concurrent HTTP requests. |
 | `--output` | `downloads` | Output directory. |
 | `--no-skip-existing` | off | Re-download tiles even if they already exist. |
 
-## How discovery works
+## How it works
 
 WebCartographer uses a standard tile pyramid where every tile at zoom `n` corresponds to up to four tiles `(2x..2x+1, 2y..2y+1)` at zoom `n+1`. The script:
 
-1. Probes a `(2·probe_radius + 1)^2` grid at the lowest zoom level with HEAD requests.
-2. Records the bounding box of tiles that returned `200 OK`.
-3. For each subsequent zoom, only probes coordinates inside the doubled bounding box (plus a small padding), then downloads the hits.
+1. Scans the initial probe box at the lowest zoom level, downloading every tile that returns `200 OK` in a single pass.
+2. For each subsequent zoom, computes the doubled bounding box of the previous zoom's hits (with a small padding) and attempts a GET on every coordinate. `404`s on the edges are expected and cheap.
 
-This keeps the discovery cost proportional to the explored world area instead of `4^max_zoom`.
+No separate HEAD-probe pass and no second GET — every successful request writes a tile straight to disk. Progress bars show `ok`, `miss` (404), `fail`, and `cached` counters in real time.
