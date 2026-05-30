@@ -42,7 +42,7 @@ python download_tiles.py --redo-zoom 5
 
 | Flag | Default | Notes |
 | --- | --- | --- |
-| `--origin` | `https://map.oldtops.vintagestory.at` | Base URL of the webmap. |
+| `--origin` | `https://map.tops.vintagestory.at` | Base URL of the webmap. |
 | `--path` | `/data/world` | Tile path prefix appended to the origin. |
 | `--min-zoom` / `--max-zoom` | `1` / `9` | Zoom range to download (WebCartographer's pyramid starts at zoom 1). |
 | `--probe-min` / `--probe-max` | `-8` / `40` | Initial probe box on both axes at the lowest zoom (defaults cover a ~1M-block world). Widen if the first zoom reports "no tiles found". |

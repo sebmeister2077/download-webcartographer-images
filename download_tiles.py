@@ -20,14 +20,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
+from typing import Iterator
 
 import aiohttp
 from tqdm import tqdm
 
 
-DEFAULT_ORIGIN = "https://map.oldtops.vintagestory.at"
+DEFAULT_ORIGIN = "https://map.tops.vintagestory.at"
 DEFAULT_PATH = "/data/world"
 DEFAULT_MIN_ZOOM = 1   # WebCartographer's pyramid starts at zoom 1.
 DEFAULT_MAX_ZOOM = 9
@@ -59,61 +61,79 @@ def local_tiles(out: Path, zoom: int) -> list[tuple[int, int]]:
         return []
 
     tiles: list[tuple[int, int]] = []
-    for path in zoom_dir.glob("*.png"):
-        try:
-            x_text, y_text = path.stem.split("_", 1)
-            tiles.append((int(x_text), int(y_text)))
-        except ValueError:
-            continue
+    with os.scandir(zoom_dir) as it:
+        for entry in it:
+            if not entry.name.endswith(".png") or not entry.is_file():
+                continue
+            stem = entry.name[:-4]
+            try:
+                x_text, y_text = stem.split("_", 1)
+                tiles.append((int(x_text), int(y_text)))
+            except ValueError:
+                continue
     return tiles
+
+
+def existing_nonempty_tiles(out: Path, zoom: int) -> set[tuple[int, int]]:
+    """Return the set of (x, y) tiles already present on disk with non-zero size.
+
+    Uses a single os.scandir pass — far faster than millions of Path.exists()
+    calls at high zoom levels.
+    """
+    zoom_dir = out / f"zoom_{zoom}"
+    if not zoom_dir.is_dir():
+        return set()
+
+    found: set[tuple[int, int]] = set()
+    with os.scandir(zoom_dir) as it:
+        for entry in it:
+            if not entry.name.endswith(".png"):
+                continue
+            try:
+                if entry.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            stem = entry.name[:-4]
+            try:
+                x_text, y_text = stem.split("_", 1)
+                found.add((int(x_text), int(y_text)))
+            except ValueError:
+                continue
+    return found
 
 
 async def fetch_tile(
     session: aiohttp.ClientSession,
     url: str,
     dest: Path,
-    sem: asyncio.Semaphore,
-    skip_existing: bool,
     retries: int = 2,
 ) -> str:
-    if skip_existing and dest.exists() and dest.stat().st_size > 0:
-        return CACHED
-    async with sem:
-        for attempt in range(retries + 1):
-            try:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        tmp = dest.with_suffix(dest.suffix + ".part")
-                        tmp.write_bytes(data)
-                        tmp.replace(dest)
-                        return OK
-                    if resp.status == 404:
-                        return MISS
-                    return FAIL
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                if attempt == retries:
-                    return FAIL
-                await asyncio.sleep(0.25 * (attempt + 1))
-        return FAIL
+    for attempt in range(retries + 1):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.with_suffix(dest.suffix + ".part")
+                    tmp.write_bytes(data)
+                    tmp.replace(dest)
+                    return OK
+                if resp.status == 404:
+                    return MISS
+                return FAIL
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == retries:
+                return FAIL
+            await asyncio.sleep(0.25 * (attempt + 1))
+    return FAIL
 
 
-async def _run_with_bar(
-    tasks: list[asyncio.Task],
-    desc: str,
-) -> dict[str, int]:
-    counts = {OK: 0, MISS: 0, FAIL: 0, CACHED: 0}
-    bar = tqdm(total=len(tasks), desc=desc, unit="tile", dynamic_ncols=True, smoothing=0.05)
-    try:
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            counts[res] = counts.get(res, 0) + 1
-            bar.update(1)
-            bar.set_postfix(ok=counts[OK], miss=counts[MISS], fail=counts[FAIL], cached=counts[CACHED])
-    finally:
-        bar.close()
-    return counts
+def _iter_box(box: tuple[int, int, int, int]) -> Iterator[tuple[int, int]]:
+    xmin, xmax, ymin, ymax = box
+    for x in range(xmin, xmax + 1):
+        for y in range(ymin, ymax + 1):
+            yield x, y
 
 
 async def process_zoom(
@@ -122,30 +142,62 @@ async def process_zoom(
     out: Path,
     zoom: int,
     box: tuple[int, int, int, int],
-    sem: asyncio.Semaphore,
+    concurrency: int,
     skip_existing: bool,
     label: str,
 ) -> tuple[dict[str, int], list[tuple[int, int]]]:
-    """Attempt to download every tile in `box` at `zoom`. Returns counts + hits."""
+    """Attempt to download every tile in `box` at `zoom` using a bounded worker
+    pool so memory stays O(concurrency) regardless of tile count."""
     xmin, xmax, ymin, ymax = box
-    coords = [(x, y) for x in range(xmin, xmax + 1) for y in range(ymin, ymax + 1)]
+    total = (xmax - xmin + 1) * (ymax - ymin + 1)
+
+    existing = existing_nonempty_tiles(out, zoom) if skip_existing else set()
+    (out / f"zoom_{zoom}").mkdir(parents=True, exist_ok=True)
+
+    counts = {OK: 0, MISS: 0, FAIL: 0, CACHED: 0}
     hits: list[tuple[int, int]] = []
-    tasks: list[asyncio.Task] = []
 
-    async def run(x: int, y: int) -> str:
-        res = await fetch_tile(
-            session, tile_url(base, zoom, x, y), tile_path(out, zoom, x, y),
-            sem, skip_existing,
-        )
-        if res in (OK, CACHED):
-            hits.append((x, y))
-        return res
+    desc = f"{label} z{zoom} ({total:,} tiles, x[{xmin}..{xmax}] y[{ymin}..{ymax}])"
+    bar = tqdm(total=total, desc=desc, unit="tile", dynamic_ncols=True, smoothing=0.05)
 
-    for x, y in coords:
-        tasks.append(asyncio.create_task(run(x, y)))
+    # Small bounded queue — just enough to keep workers fed without buffering
+    # the entire coordinate space in memory.
+    queue: asyncio.Queue[tuple[int, int] | None] = asyncio.Queue(maxsize=concurrency * 4)
 
-    desc = f"{label} z{zoom} ({len(coords):,} tiles, x[{xmin}..{xmax}] y[{ymin}..{ymax}])"
-    counts = await _run_with_bar(tasks, desc)
+    async def producer() -> None:
+        for coord in _iter_box(box):
+            await queue.put(coord)
+        for _ in range(concurrency):
+            await queue.put(None)
+
+    async def worker() -> None:
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            x, y = item
+            if (x, y) in existing:
+                res = CACHED
+            else:
+                res = await fetch_tile(
+                    session, tile_url(base, zoom, x, y), tile_path(out, zoom, x, y),
+                )
+            if res in (OK, CACHED):
+                hits.append((x, y))
+            counts[res] = counts.get(res, 0) + 1
+            bar.update(1)
+            # Update postfix only every so often to avoid tqdm overhead at high rates.
+            if (counts[OK] + counts[MISS] + counts[FAIL] + counts[CACHED]) % 256 == 0:
+                bar.set_postfix(ok=counts[OK], miss=counts[MISS], fail=counts[FAIL], cached=counts[CACHED])
+
+    try:
+        workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+        prod = asyncio.create_task(producer())
+        await asyncio.gather(prod, *workers)
+    finally:
+        bar.set_postfix(ok=counts[OK], miss=counts[MISS], fail=counts[FAIL], cached=counts[CACHED])
+        bar.close()
+
     return counts, hits
 
 
@@ -183,7 +235,6 @@ async def main_async(args: argparse.Namespace) -> int:
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
-    sem = asyncio.Semaphore(args.concurrency)
     timeout = aiohttp.ClientTimeout(total=60, connect=20)
     connector = aiohttp.TCPConnector(
         limit=args.concurrency * 2,
@@ -214,7 +265,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 out,
                 args.redo_zoom,
                 box,
-                sem,
+                args.concurrency,
                 False,
                 "redo",
             )
@@ -249,7 +300,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 label = "fetch"
 
             counts, hits = await process_zoom(
-                session, base, out, zoom, box, sem, args.skip_existing, label,
+                session, base, out, zoom, box, args.concurrency, args.skip_existing, label,
             )
             for k, v in counts.items():
                 totals[k] = totals.get(k, 0) + v
